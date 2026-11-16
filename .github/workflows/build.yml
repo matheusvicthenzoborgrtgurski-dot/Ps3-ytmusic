@@ -41,7 +41,9 @@ jobs:
           PSL1GHT: /usr/local/ps3dev
         run: |
           make
+          PREFIX=powerpc64-ps3-elf-     
           make pkg
+          PREFIX=powerpc64-ps3-elf-
           test -s cell-music.pkg
 
       - name: Upload PKG
