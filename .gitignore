@@ -5,3 +5,4 @@ build/
 *.gnpdrm.pkg
 *.o
 *.d
+.preview/
