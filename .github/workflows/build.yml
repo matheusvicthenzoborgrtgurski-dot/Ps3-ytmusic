@@ -1,3 +1,4 @@
+
 name: Build CELL MUSIC PKG
 
 on:
@@ -12,11 +13,12 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get ps3dev build environment
+      - name: Get PS3 build environment
         run: |
           git clone --depth 1 https://github.com/ps3dev/ps3dev.git /tmp/ps3dev
           cd /tmp/ps3dev
@@ -39,11 +41,11 @@ jobs:
         env:
           PS3DEV: /usr/local/ps3dev
           PSL1GHT: /usr/local/ps3dev
+          PREFIX: powerpc64-ps3-elf-
         run: |
+          make clean
           make
-          PREFIX=powerpc64-ps3-elf-     
           make pkg
-          PREFIX=powerpc64-ps3-elf-
           test -s cell-music.pkg
 
       - name: Upload PKG
