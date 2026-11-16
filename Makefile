@@ -8,7 +8,12 @@ PKGFILES    := data
 
 # OFILES precisa ser definido antes do include: a regra %.elf de base_rules
 # usa $(OFILES) como pre-requisito no momento em que e lida.
-OFILES      := source/main.o source/gfx.o
+OFILES      := source/main.o \
+               source/gfx.o \
+               source/ui.o \
+               source/input_pad.o \
+               source/input_kb.o \
+               source/input_mouse.o
 
 include $(PSL1GHT)/ppu_rules
 
