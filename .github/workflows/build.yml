@@ -1,0 +1,52 @@
+name: Build CELL MUSIC PKG
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get ps3dev build environment
+        run: |
+          git clone --depth 1 https://github.com/ps3dev/ps3dev.git /tmp/ps3dev
+          cd /tmp/ps3dev
+          sudo ./prepare.sh
+
+      - name: Build PS3 toolchain and PSL1GHT
+        env:
+          PS3DEV: /usr/local/ps3dev
+          PSL1GHT: /usr/local/ps3dev
+        run: |
+          sudo mkdir -p "$PS3DEV"
+          sudo chown -R "$USER":"$USER" "$PS3DEV"
+          cd /tmp/ps3dev
+          ./build-all.sh
+          echo "$PS3DEV/bin" >> "$GITHUB_PATH"
+          echo "$PS3DEV/ppu/bin" >> "$GITHUB_PATH"
+          echo "$PS3DEV/spu/bin" >> "$GITHUB_PATH"
+
+      - name: Build application and package
+        env:
+          PS3DEV: /usr/local/ps3dev
+          PSL1GHT: /usr/local/ps3dev
+        run: |
+          make
+          make pkg
+          test -s cell-music.pkg
+
+      - name: Upload PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: cell-music-pkg
+          path: cell-music.pkg
+          if-no-files-found: error
