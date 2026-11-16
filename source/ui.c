@@ -1,253 +1,179 @@
-/* ui.c - interface do CELL MUSIC (desenhada com gfx.c, sem SDL)
+/* ui.c - interface do YouTube Music para PS3
  *
- * Contem o layout (barra superior, menu lateral, lista central, barra de
- * reproducao), a navegacao por controle/teclado/mouse, a pesquisa digitada e
- * o dialogo de encerramento.
+ * Layout inspirado no YouTube Music para desktop: barra superior com pesquisa,
+ * menu lateral, area de conteudo com cartoes/resultados e barra de reproducao.
+ * Todos os dados vem do modulo ytm (InnerTube ou proxy) e o audio do modulo
+ * audio (libmad + cellAudio).
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "ui.h"
+#include "ytm.h"
+#include "audio.h"
 
-#define MAX_TRACKS 8
 #define ROWS_VISIBLE 6
-#define SEARCH_MAX 28
+#define QUERY_MAX    48
 
-typedef struct
+enum
 {
-    const char *title;
-    const char *artist;
-    const char *duration;
-} track_info;
-
-static const char *nav_items[] = { "Inicio", "Biblioteca" };
-#define NAV_COUNT ((int)(sizeof(nav_items) / sizeof(nav_items[0])))
-
-static const track_info recent_tracks[MAX_TRACKS] = {
-    { "In the Air Tonight", "Phil Collins", "05:32" },
-    { "Someone Like You", "Adele", "04:45" },
-    { "Flowers", "Miley Cyrus", "03:20" },
-    { "The Sound of Silence", "Disturbed", "04:08" },
-    { "Bob Marley - Everything", "Mislav Vonic", "05:12" },
-    { "Made For Me", "Muni Long", "03:41" },
-    { "Enemy", "Imagine Dragons", "03:53" },
-    { "As It Was", "Harry Styles", "02:47" },
-};
-
-static const track_info library_tracks[MAX_TRACKS] = {
-    { "Killer In The Mirror", "Set It Off", "03:11" },
-    { "Different Songs", "Set It Off", "03:46" },
-    { "Midnight Thoughts", "Set It Off", "02:57" },
-    { "Hourglass", "Set It Off", "02:57" },
-    { "Go To Bed Angry", "Set It Off", "03:11" },
-    { "Happy All The Time", "Set It Off", "03:39" },
-    { "Wolf in Sheep's Clothing", "Set It Off", "03:00" },
-    { "Partners in Crime", "Set It Off", "03:12" },
+    UI_IDLE = 0,
+    UI_SEARCHING,
+    UI_RESULTS,
+    UI_LOADING,
+    UI_ERROR
 };
 
 enum
 {
-    FOCUS_MENU = 0,
-    FOCUS_LIST = 1,
-    FOCUS_SEARCH = 2
+    FOCUS_SEARCH = 0,
+    FOCUS_SIDE,
+    FOCUS_LIST
 };
 
 static struct
 {
-    int nav;
-    int track;
-    int scroll;
-    int playing;
+    int state;
     int focus;
+    int nav;
+    int selected;
+    int scroll;
     int search_edit;
-    char search[SEARCH_MAX + 1];
+    char query[QUERY_MAX + 1];
+    char message[192];
+    char notice[160];
     int exit_prompt;
-    int exit_choice; /* 0 = cancelar, 1 = sair */
+    int exit_choice;
+    int playing;
+    ytm_track tracks[YTM_MAX_TRACKS];
+    int track_count;
+    int audio_ok;
 } app;
 
-/* filtro atual */
-static const track_info *filtered[MAX_TRACKS];
-static int filtered_count = 0;
-
-/* ultima entrada lida (usada para mostrar o estado dos dispositivos) */
 static ui_input last_input;
 
-/* layout calculado por quadro */
-static f32 ui_scale = 1.0f;
+/* geometria */
+static f32 s = 1.0f;
+static f32 top_h, side_w, player_h;
+static f32 search_x, search_y, search_w, search_h;
+static f32 list_x, list_y, list_w, row_h;
+static f32 side_x, side_y, side_w2, side_item_h;
 
-/* geometria (em pixels, ja com escala) */
-typedef struct
-{
-    f32 top_h;
-    f32 side_w;
-    f32 player_h;
-    f32 search_x, search_y, search_w, search_h;
-    f32 list_x, list_y, list_w, row_h;
-    f32 nav_x, nav_y, nav_w, nav_item_h;
-} metrics;
+static const char *nav_items[3] = { "Inicio", "Explorar", "Biblioteca" };
 
-static metrics m;
+/* ------------------------------------------------------------------ */
+/* utilitarios de desenho                                             */
+/* ------------------------------------------------------------------ */
 
-static void compute_metrics(void)
+static void measure(void)
 {
     f32 w = (f32)gfxWidth();
     f32 h = (f32)gfxHeight();
 
-    ui_scale = h / 720.0f;
-    if (ui_scale <= 0.0f)
-        ui_scale = 1.0f;
+    s = h / 720.0f;
+    if (s <= 0.0f)
+        s = 1.0f;
 
-    m.top_h = 64.0f * ui_scale;
-    m.side_w = 280.0f * ui_scale;
-    m.player_h = 96.0f * ui_scale;
+    top_h = 64.0f * s;
+    side_w = 280.0f * s;
+    player_h = 88.0f * s;
 
-    m.search_x = 440.0f * ui_scale;
-    m.search_y = 18.0f * ui_scale;
-    m.search_w = w - m.search_x - 150.0f * ui_scale;
-    m.search_h = 30.0f * ui_scale;
+    search_x = w * 0.32f;
+    search_y = 16.0f * s;
+    search_w = w * 0.36f;
+    search_h = 32.0f * s;
+    if (search_x + search_w > w - 220.0f * s)
+        search_w = w - 220.0f * s - search_x;
 
-    m.list_x = m.side_w + 24.0f * ui_scale;
-    m.list_y = m.top_h + 132.0f * ui_scale;
-    m.list_w = w - m.list_x - 24.0f * ui_scale;
-    m.row_h = 62.0f * ui_scale;
+    list_x = side_w + 32.0f * s;
+    list_y = top_h + 150.0f * s;
+    list_w = w - list_x - 32.0f * s;
+    row_h = 64.0f * s;
 
-    m.nav_x = 16.0f * ui_scale;
-    m.nav_y = m.top_h + 28.0f * ui_scale;
-    m.nav_w = m.side_w - 32.0f * ui_scale;
-    m.nav_item_h = 52.0f * ui_scale;
+    side_x = 20.0f * s;
+    side_y = top_h + 24.0f * s;
+    side_w2 = side_w - 40.0f * s;
+    side_item_h = 46.0f * s;
 }
 
-static const char *current_heading(void)
+static void play_icon(f32 x, f32 y, f32 size, u32 color)
 {
-    return app.nav == 0 ? "Tocadas recentemente" : "Biblioteca";
-}
-
-static const char *current_subheading(void)
-{
-    return app.nav == 0 ? "Com base no seu historico" : "Todas as musicas";
-}
-
-/* ------------------------------------------------------------------ */
-/* filtro / lista                                                     */
-/* ------------------------------------------------------------------ */
-
-static int contains_ci(const char *haystack, const char *needle)
-{
-    size_t nlen;
-    const char *p;
-
-    if (needle == NULL || needle[0] == '\0')
-        return 1;
-
-    nlen = strlen(needle);
-
-    for (p = haystack; *p != '\0'; p++)
-    {
-        size_t i;
-        int match = 1;
-
-        for (i = 0; i < nlen; i++)
-        {
-            char a = p[i];
-            char b = needle[i];
-
-            if (a >= 'A' && a <= 'Z')
-                a = (char)(a - 'A' + 'a');
-            if (b >= 'A' && b <= 'Z')
-                b = (char)(b - 'A' + 'a');
-
-            if (a != b || a == '\0')
-            {
-                match = 0;
-                break;
-            }
-        }
-
-        if (match)
-            return 1;
-    }
-
-    return 0;
-}
-
-static void rebuild_filter(void)
-{
-    const track_info *src = (app.nav == 0) ? recent_tracks : library_tracks;
     int i;
-
-    filtered_count = 0;
-
-    for (i = 0; i < MAX_TRACKS; i++)
-    {
-        if (contains_ci(src[i].title, app.search) ||
-            contains_ci(src[i].artist, app.search))
-        {
-            filtered[filtered_count++] = &src[i];
-        }
-    }
-
-    if (app.track >= filtered_count)
-        app.track = filtered_count > 0 ? filtered_count - 1 : 0;
-
-    if (app.scroll > filtered_count - ROWS_VISIBLE)
-        app.scroll = filtered_count - ROWS_VISIBLE;
-    if (app.scroll < 0)
-        app.scroll = 0;
-}
-
-static void clamp_scroll(void)
-{
-    int max_scroll = filtered_count - ROWS_VISIBLE;
-
-    if (max_scroll < 0)
-        max_scroll = 0;
-
-    if (app.scroll > max_scroll)
-        app.scroll = max_scroll;
-    if (app.scroll < 0)
-        app.scroll = 0;
-
-    /* mantem a selecao visivel */
-    if (app.track < app.scroll)
-        app.scroll = app.track;
-    if (app.track >= app.scroll + ROWS_VISIBLE)
-        app.scroll = app.track - ROWS_VISIBLE + 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* desenho                                                            */
-/* ------------------------------------------------------------------ */
-
-static void draw_triangle_right(f32 x, f32 y, f32 w, f32 h, u32 color)
-{
-    const int slices = 10;
-    int i;
+    const int slices = 12;
 
     for (i = 0; i < slices; i++)
     {
         f32 t = (f32)i / (f32)slices;
-        f32 col_w = w / (f32)slices;
-        f32 col_h = h * (1.0f - t);
-        f32 col_y = y + (h - col_h) * 0.5f;
+        f32 col_w = size / (f32)slices;
+        f32 col_h = size * (1.0f - t);
 
-        gfxRect(x + (f32)i * col_w, col_y, col_w + 0.5f, col_h, color);
+        gfxRect(x + (f32)i * col_w, y + (size - col_h) * 0.5f, col_w + 0.5f,
+                col_h, color);
     }
 }
 
-static void draw_triangle_left(f32 x, f32 y, f32 w, f32 h, u32 color)
+static void pause_icon(f32 x, f32 y, f32 size, u32 color)
 {
-    const int slices = 10;
-    int i;
+    gfxRect(x, y, size * 0.32f, size, color);
+    gfxRect(x + size * 0.68f - size * 0.32f + size * 0.32f, y, size * 0.32f,
+            size, color);
+}
 
-    for (i = 0; i < slices; i++)
+static void prev_icon(f32 x, f32 y, f32 size, u32 color)
+{
+    gfxRect(x, y, size * 0.18f, size, color);
+    play_icon(x + size * 0.22f, y, size * 0.78f, color);
+}
+
+static void next_icon(f32 x, f32 y, f32 size, u32 color)
+{
+    play_icon(x, y, size * 0.78f, color);
+    gfxRect(x + size * 0.82f, y, size * 0.18f, size, color);
+}
+
+static void magnifier(f32 x, f32 y, f32 size, u32 color)
+{
+    gfxRectOutline(x, y, size * 0.72f, size * 0.72f, 2.0f * s, color);
+    gfxRect(x + size * 0.66f, y + size * 0.66f, size * 0.34f, 2.0f * s, color);
+}
+
+static void home_icon(f32 x, f32 y, f32 size, u32 color)
+{
+    gfxRect(x, y + size * 0.42f, size, size * 0.58f, color);
+    gfxRect(x + size * 0.14f, y + size * 0.24f, size * 0.72f, size * 0.2f,
+            color);
+    gfxRect(x + size * 0.3f, y + size * 0.08f, size * 0.4f, size * 0.18f, color);
+}
+
+static void compass_icon(f32 x, f32 y, f32 size, u32 color)
+{
+    gfxRectOutline(x, y, size, size, 2.0f * s, color);
+    gfxRect(x + size * 0.45f, y + size * 0.2f, size * 0.16f, size * 0.6f,
+            color);
+}
+
+static void library_icon(f32 x, f32 y, f32 size, u32 color)
+{
+    gfxRect(x, y, size * 0.22f, size, color);
+    gfxRect(x + size * 0.32f, y, size * 0.22f, size, color);
+    gfxRect(x + size * 0.66f, y, size * 0.3f, size, color);
+}
+
+static void draw_cover(f32 x, f32 y, f32 size, int filled)
+{
+    gfxRect(x, y, size, size, GFX_ARGB(0xff, 0x21, 0x21, 0x21));
+
+    if (filled)
     {
-        f32 t = (f32)i / (f32)slices;
-        f32 col_w = w / (f32)slices;
-        f32 col_h = h * (1.0f - t);
-        f32 col_y = y + (h - col_h) * 0.5f;
+        f32 inner = size * 0.36f;
 
-        gfxRect(x + w - (f32)(i + 1) * col_w, col_y, col_w + 0.5f, col_h,
-                color);
+        gfxRect(x + (size - inner) * 0.5f, y + (size - inner) * 0.5f, inner,
+                inner, GFX_RED);
+    }
+    else
+    {
+        gfxRect(x + size * 0.28f, y + size * 0.28f, size * 0.44f, size * 0.44f,
+                GFX_ARGB(0xff, 0x2e, 0x2e, 0x2e));
     }
 }
 
@@ -268,351 +194,520 @@ static void draw_cursor(f32 x, f32 y)
     gfxRect(x + 4.0f, y + 14.0f, 2.0f, 6.0f, GFX_BLACK);
 }
 
-static void draw_thumbnail(f32 x, f32 y, f32 size, int accent)
+static void text_center(f32 cx, f32 y, f32 scale, u32 color, const char *text)
 {
-    gfxRect(x, y, size, size, GFX_ARGB(0xff, 0x24, 0x24, 0x24));
-
-    if (accent)
-    {
-        f32 inner = size * 0.34f;
-
-        gfxRect(x + (size - inner) * 0.5f, y + (size - inner) * 0.5f,
-                inner, inner, GFX_RED);
-    }
+    gfxText(cx - gfxTextWidth(text, scale) * 0.5f, y, scale, color, text);
 }
 
-static f32 scale(void) { return ui_scale; }
-
-static void draw_top_bar(const ui_input *in)
+static void fmt_time(int seconds, char *out, size_t size)
 {
-    f32 s = scale();
-    f32 h = m.top_h;
-    f32 logo = 22.0f * s;
+    if (seconds < 0)
+        seconds = 0;
 
-    gfxRect(0, 0, (f32)gfxWidth(), h, GFX_ARGB(0xff, 0x0b, 0x0b, 0x0b));
-    gfxRect(0, h - 2.0f * s, (f32)gfxWidth(), 2.0f * s, GFX_RED);
+    snprintf(out, size, "%d:%02d", seconds / 60, seconds % 60);
+}
 
-    gfxRect(24.0f * s, (h - logo) * 0.5f, logo, logo, GFX_RED);
-    gfxText(24.0f * s + 3.0f * s, (h - logo) * 0.5f + 3.0f * s, 2.0f * s,
-            GFX_BLACK, "M");
+/* ------------------------------------------------------------------ */
+/* desenho das secoes                                                 */
+/* ------------------------------------------------------------------ */
 
-    gfxText(58.0f * s, (h - 24.0f * s) * 0.5f, 3.0f * s, GFX_WHITE,
-            "CELL MUSIC");
+static void draw_top_bar(void)
+{
+    f32 w = (f32)gfxWidth();
+    f32 logo = 30.0f * s;
+
+    gfxRect(0, 0, w, top_h, GFX_ARGB(0xff, 0x03, 0x03, 0x03));
+
+    /* menu */
+    {
+        f32 bx = 24.0f * s;
+        f32 by = (top_h - 16.0f * s) * 0.5f;
+        int i;
+
+        for (i = 0; i < 3; i++)
+            gfxRect(bx, by + (f32)i * 6.0f * s, 18.0f * s, 2.0f * s, GFX_WHITE);
+    }
+
+    /* logo do YouTube Music */
+    gfxRect(56.0f * s, (top_h - logo) * 0.5f, logo, logo, GFX_RED);
+    play_icon(56.0f * s + logo * 0.3f, (top_h - logo) * 0.5f + logo * 0.26f,
+              logo * 0.5f, GFX_WHITE);
+    gfxText(96.0f * s, (top_h - 20.0f * s) * 0.5f, 2.5f * s, GFX_WHITE,
+            "YouTube Music");
 
     /* caixa de pesquisa */
-    gfxRect(m.search_x, m.search_y, m.search_w, m.search_h,
-            GFX_ARGB(0xff, 0x1a, 0x1a, 0x1a));
+    gfxRect(search_x, search_y, search_w, search_h,
+            GFX_ARGB(0xff, 0x14, 0x14, 0x14));
+    gfxRectOutline(search_x, search_y, search_w, search_h, 1.0f * s,
+                   (app.focus == FOCUS_SEARCH) ? GFX_RED
+                                               : GFX_ARGB(0xff, 0x2a, 0x2a, 0x2a));
+    magnifier(search_x + 10.0f * s, search_y + 10.0f * s, 14.0f * s, GFX_GRAY);
 
-    if (app.focus == FOCUS_SEARCH)
-        gfxRectOutline(m.search_x, m.search_y, m.search_w, m.search_h,
-                       2.0f * s, GFX_RED);
-
-    if (app.search[0] != '\0')
-    {
-        gfxText(m.search_x + 12.0f * s,
-                m.search_y + (m.search_h - gfxTextHeight(2.0f * s)) * 0.5f,
-                2.0f * s, GFX_WHITE, app.search);
-    }
+    if (app.query[0] != '\0')
+        gfxText(search_x + 34.0f * s,
+                search_y + (search_h - gfxTextHeight(2.0f * s)) * 0.5f, 2.0f * s,
+                GFX_WHITE, app.query);
     else
-    {
-        gfxText(m.search_x + 12.0f * s,
-                m.search_y + (m.search_h - gfxTextHeight(2.0f * s)) * 0.5f,
-                2.0f * s, GFX_GRAY_DARK, "Pesquisar musicas, artistas");
-    }
+        gfxText(search_x + 34.0f * s,
+                search_y + (search_h - gfxTextHeight(2.0f * s)) * 0.5f, 2.0f * s,
+                GFX_GRAY_DARK, "Pesquisar musicas, artistas, albuns");
 
-    /* cursor de texto piscando no modo de digitacao */
     if (app.search_edit && ((gfxFrameCount() / 20) % 2) == 0)
     {
-        f32 caret_x = m.search_x + 12.0f * s + gfxTextWidth(app.search, 2.0f * s);
+        f32 caret = search_x + 34.0f * s + gfxTextWidth(app.query, 2.0f * s);
 
-        gfxRect(caret_x, m.search_y + 6.0f * s, 2.0f * s,
-                m.search_h - 12.0f * s, GFX_RED);
+        gfxRect(caret, search_y + 6.0f * s, 2.0f * s, search_h - 12.0f * s,
+                GFX_RED);
     }
 
-    gfxText((f32)gfxWidth() - 92.0f * s, (h - 16.0f * s) * 0.5f, 2.0f * s,
-            GFX_GRAY, "PS3");
-
-    (void)in;
+    /* avatar */
+    gfxRect(w - 64.0f * s, (top_h - 26.0f * s) * 0.5f, 26.0f * s, 26.0f * s,
+            GFX_ARGB(0xff, 0x53, 0x53, 0x53));
+    gfxText(w - 56.0f * s, (top_h - 14.0f * s) * 0.5f, 2.0f * s, GFX_WHITE, "M");
 }
 
-static void draw_sidebar(const ui_input *in)
+static void draw_sidebar(void)
 {
-    f32 s = scale();
-    f32 top = m.top_h;
-    f32 bottom = (f32)gfxHeight() - m.player_h;
+    f32 h = (f32)gfxHeight();
+    f32 bottom = h - player_h;
     int i;
 
-    gfxRect(0, top, m.side_w, bottom - top, GFX_ARGB(0xff, 0x0e, 0x0e, 0x0e));
-    gfxRect(m.side_w - 2.0f * s, top, 2.0f * s, bottom - top,
-            GFX_ARGB(0xff, 0x1c, 0x1c, 0x1c));
+    gfxRect(0, top_h, side_w, bottom - top_h, GFX_ARGB(0xff, 0x03, 0x03, 0x03));
 
-    for (i = 0; i < NAV_COUNT; i++)
+    for (i = 0; i < 3; i++)
     {
-        f32 y = m.nav_y + (f32)i * (m.nav_item_h + 8.0f * s);
+        f32 y = side_y + (f32)i * (side_item_h + 4.0f * s);
         int selected = (app.nav == i);
-        int focused = selected && (app.focus == FOCUS_MENU);
+        u32 color = selected ? GFX_WHITE : GFX_GRAY;
+        f32 ix = side_x + 12.0f * s;
+        f32 iy = y + (side_item_h - 16.0f * s) * 0.5f;
 
         if (selected)
         {
-            gfxRect(m.nav_x, y, m.nav_w, m.nav_item_h,
-                    GFX_ARGB(0xff, 0x1c, 0x1c, 0x1c));
-            gfxRect(m.nav_x, y, 4.0f * s, m.nav_item_h, GFX_RED);
+            gfxRect(side_x, y, side_w2, side_item_h,
+                    GFX_ARGB(0xff, 0x14, 0x14, 0x14));
+            gfxRect(side_x, y, 3.0f * s, side_item_h, GFX_RED);
         }
 
-        gfxRect(m.nav_x + 24.0f * s,
-                y + (m.nav_item_h - 14.0f * s) * 0.5f, 14.0f * s, 14.0f * s,
-                focused ? GFX_RED : GFX_GRAY_DARK);
+        if (i == 0)
+            home_icon(ix, iy, 16.0f * s, color);
+        else if (i == 1)
+            compass_icon(ix, iy, 16.0f * s, color);
+        else
+            library_icon(ix, iy, 16.0f * s, color);
 
-        gfxText(m.nav_x + 52.0f * s,
-                y + (m.nav_item_h - gfxTextHeight(2.0f * s)) * 0.5f, 2.0f * s,
-                focused ? GFX_WHITE : GFX_GRAY, nav_items[i]);
+        gfxText(side_x + 44.0f * s,
+                y + (side_item_h - gfxTextHeight(2.0f * s)) * 0.5f, 2.0f * s,
+                color, nav_items[i]);
     }
 
-    /* estado dos dispositivos de entrada */
+    /* playlists */
+    gfxText(side_x + 12.0f * s, side_y + 3.0f * (side_item_h + 4.0f * s) +
+                                     20.0f * s,
+            1.5f * s, GFX_GRAY_DARK, "PLAYLISTS");
+    gfxText(side_x + 12.0f * s, side_y + 3.0f * (side_item_h + 4.0f * s) +
+                                     44.0f * s,
+            1.8f * s, GFX_GRAY, "Meu mix");
+
+    /* estado dos dispositivos e da rede */
     {
-        f32 y = bottom - 84.0f * s;
+        f32 y = bottom - 96.0f * s;
 
-        gfxText(m.nav_x + 8.0f * s, y, 1.5f * s,
-                in->pad.connected ? GFX_GRAY : GFX_RED,
-                in->pad.connected ? "CONTROLE OK" : "CONTROLE --");
-        gfxText(m.nav_x + 8.0f * s, y + 18.0f * s, 1.5f * s,
-                in->kb.connected ? GFX_GRAY : GFX_GRAY_DARK,
-                in->kb.connected ? "TECLADO OK" : "TECLADO --");
-        gfxText(m.nav_x + 8.0f * s, y + 36.0f * s, 1.5f * s,
-                in->mouse.connected ? GFX_GRAY : GFX_GRAY_DARK,
-                in->mouse.connected ? "MOUSE OK" : "MOUSE --");
+        gfxText(side_x + 8.0f * s, y, 1.5f * s,
+                ytm_net_ok() ? GFX_GRAY_DARK : GFX_RED,
+                ytm_net_ok() ? "REDE OK" : "REDE OFF");
+        gfxText(side_x + 8.0f * s, y + 18.0f * s, 1.5f * s,
+                app.audio_ok ? GFX_GRAY_DARK : GFX_RED,
+                app.audio_ok ? "AUDIO OK" : "AUDIO OFF");
+        gfxText(side_x + 8.0f * s, y + 36.0f * s, 1.5f * s,
+                last_input.pad.connected ? GFX_GRAY_DARK : GFX_RED,
+                last_input.pad.connected ? "CONTROLE OK" : "CONTROLE --");
+        gfxText(side_x + 8.0f * s, y + 54.0f * s, 1.5f * s,
+                last_input.kb.connected ? GFX_GRAY_DARK : GFX_RED,
+                last_input.kb.connected ? "TECLADO OK" : "TECLADO --");
+        gfxText(side_x + 8.0f * s, y + 72.0f * s, 1.5f * s,
+                last_input.mouse.connected ? GFX_GRAY_DARK : GFX_RED,
+                last_input.mouse.connected ? "MOUSE OK" : "MOUSE --");
     }
-
-    gfxText(m.nav_x + 8.0f * s, bottom - 24.0f * s, 1.5f * s, GFX_GRAY_DARK,
-            "SELECT: SAIR");
 }
 
-static void draw_list(const ui_input *in)
+static void draw_idle(void)
 {
-    f32 s = scale();
+    static const char *cards[6] = { "Mix diario 1", "Mix diario 2",
+                                    "Descobertas", "Favoritas",
+                                    "Tocadas recentes", "Novidades" };
     int i;
 
-    (void)in;
+    gfxText(list_x, top_h + 48.0f * s, 3.5f * s, GFX_WHITE, "Boa noite");
+    gfxText(list_x, top_h + 88.0f * s, 1.6f * s, GFX_GRAY_DARK,
+            "Pesquise uma musica para comecar (TAB e digite)");
 
-    gfxText(m.list_x, m.top_h + 40.0f * s, 3.0f * s, GFX_WHITE,
-            current_heading());
-    gfxText(m.list_x, m.top_h + 76.0f * s, 1.5f * s, GFX_GRAY,
-            current_subheading());
-
-    gfxRect(m.list_x - 8.0f * s, m.list_y - 8.0f * s, m.list_w,
-            (f32)ROWS_VISIBLE * m.row_h + 16.0f * s,
-            GFX_ARGB(0xff, 0x11, 0x11, 0x11));
-
-    if (filtered_count == 0)
+    for (i = 0; i < 6; i++)
     {
-        gfxText(m.list_x + 20.0f * s, m.list_y + 20.0f * s, 2.0f * s, GFX_GRAY,
-                "Nenhum resultado");
-        return;
+        int col = i % 3;
+        int row = i / 3;
+        f32 cw = (list_w - 40.0f * s) / 3.0f;
+        f32 x = list_x + (f32)col * (cw + 20.0f * s);
+        f32 y = list_y + (f32)row * (cw + 46.0f * s);
+
+        draw_cover(x, y, cw, 0);
+        gfxText(x, y + cw + 10.0f * s, 1.8f * s, GFX_WHITE, cards[i]);
     }
+}
+
+static void draw_results(void)
+{
+    char heading[128];
+    int i;
+
+    snprintf(heading, sizeof(heading), "Resultados para \"%s\"", app.query);
+    gfxText(list_x, top_h + 48.0f * s, 2.4f * s, GFX_WHITE, heading);
+
+    if (app.notice[0] != '\0')
+        gfxText(list_x, top_h + 82.0f * s, 1.5f * s, GFX_RED, app.notice);
+    else
+        gfxText(list_x, top_h + 82.0f * s, 1.5f * s, GFX_GRAY_DARK,
+                "X/ENTER toca   SELECT abre o menu de saida");
 
     for (i = 0; i < ROWS_VISIBLE; i++)
     {
         int index = app.scroll + i;
-        f32 row_y = m.list_y + (f32)i * m.row_h;
+        f32 y = list_y + (f32)i * row_h;
+        ytm_track *t;
+        char dur[16];
+        int selected;
 
-        if (index >= filtered_count)
+        if (index >= app.track_count)
             break;
 
+        t = &app.tracks[index];
+        selected = (index == app.selected);
+
+        if (selected)
         {
-            const track_info *t = filtered[index];
-            int selected = (app.track == index);
-            int playing = (app.playing == index);
+            gfxRect(list_x - 12.0f * s, y, list_w + 12.0f * s, row_h,
+                    GFX_ARGB(0xff, 0x1a, 0x1a, 0x1a));
+            gfxRect(list_x - 12.0f * s, y, 3.0f * s, row_h,
+                    (app.focus == FOCUS_LIST) ? GFX_RED : GFX_RED_DARK);
+        }
 
-            if (selected)
-            {
-                gfxRect(m.list_x - 8.0f * s, row_y, m.list_w, m.row_h,
-                        GFX_ARGB(0xff, 0x1b, 0x1b, 0x1b));
-                gfxRect(m.list_x - 8.0f * s, row_y, 4.0f * s, m.row_h,
-                        (app.focus == FOCUS_LIST) ? GFX_RED : GFX_RED_DARK);
-            }
+        draw_cover(list_x + 8.0f * s, y + 8.0f * s, 48.0f * s,
+                   app.playing == index);
 
-            draw_thumbnail(m.list_x + 12.0f * s, row_y + 9.0f * s,
-                           44.0f * s, playing);
+        gfxText(list_x + 72.0f * s, y + 12.0f * s, 2.0f * s,
+                (app.playing == index) ? GFX_RED : GFX_WHITE, t->title);
 
-            gfxText(m.list_x + 72.0f * s, row_y + 10.0f * s, 2.0f * s,
-                    playing ? GFX_RED : GFX_WHITE, t->title);
-            gfxText(m.list_x + 72.0f * s, row_y + 34.0f * s, 1.5f * s,
-                    GFX_GRAY, t->artist);
+        {
+            const char *kind = NULL;
+            char subtitle[160];
 
-            gfxText(m.list_x + m.list_w - 24.0f * s -
-                        gfxTextWidth(t->duration, 1.5f * s),
-                    row_y + 34.0f * s, 1.5f * s, GFX_GRAY, t->duration);
+            if (t->kind == YTM_KIND_ALBUM)
+                kind = "Album";
+            else if (t->kind == YTM_KIND_PLAYLIST)
+                kind = "Playlist";
+            else if (t->kind == YTM_KIND_ARTIST)
+                kind = "Artista";
+
+            if (kind != NULL && t->artist[0] != '\0')
+                snprintf(subtitle, sizeof(subtitle), "%s - %s", kind, t->artist);
+            else if (kind != NULL)
+                snprintf(subtitle, sizeof(subtitle), "%s", kind);
+            else
+                snprintf(subtitle, sizeof(subtitle), "%s", t->artist);
+
+            if (subtitle[0] != '\0')
+                gfxText(list_x + 72.0f * s, y + 36.0f * s, 1.5f * s, GFX_GRAY,
+                        subtitle);
+        }
+
+        if (t->duration > 0)
+        {
+            fmt_time(t->duration, dur, sizeof(dur));
+            gfxText(list_x + list_w - 20.0f * s -
+                        gfxTextWidth(dur, 1.5f * s),
+                    y + 36.0f * s, 1.5f * s, GFX_GRAY, dur);
         }
     }
 
-    /* indicador de rolagem */
-    if (filtered_count > ROWS_VISIBLE)
+    if (app.track_count > ROWS_VISIBLE)
     {
-        f32 track_h = (f32)ROWS_VISIBLE * m.row_h;
-        f32 bar_h = track_h * (f32)ROWS_VISIBLE / (f32)filtered_count;
-        f32 bar_y = m.list_y + track_h * (f32)app.scroll / (f32)filtered_count;
+        f32 track_h = (f32)ROWS_VISIBLE * row_h;
+        f32 bar_h = track_h * (f32)ROWS_VISIBLE / (f32)app.track_count;
+        f32 bar_y = list_y + track_h * (f32)app.scroll / (f32)app.track_count;
 
-        gfxRect(m.list_x + m.list_w - 6.0f * s, m.list_y, 4.0f * s, track_h,
+        gfxRect(list_x + list_w - 4.0f * s, list_y, 4.0f * s, track_h,
                 GFX_ARGB(0xff, 0x22, 0x22, 0x22));
-        gfxRect(m.list_x + m.list_w - 6.0f * s, bar_y, 4.0f * s, bar_h,
-                GFX_RED);
+        gfxRect(list_x + list_w - 4.0f * s, bar_y, 4.0f * s, bar_h, GFX_RED);
+    }
+}
+
+static void draw_content(void)
+{
+    switch (app.state)
+    {
+    case UI_SEARCHING:
+        text_center((f32)gfxWidth() * 0.5f, (f32)gfxHeight() * 0.45f,
+                    2.4f * s, GFX_WHITE, "Pesquisando no YouTube Music...");
+        break;
+
+    case UI_LOADING:
+        text_center((f32)gfxWidth() * 0.5f, (f32)gfxHeight() * 0.45f,
+                    2.4f * s, GFX_WHITE, "Carregando faixa...");
+        break;
+
+    case UI_ERROR:
+        gfxText(list_x, top_h + 60.0f * s, 2.2f * s, GFX_RED, "Falha");
+        gfxText(list_x, top_h + 100.0f * s, 1.8f * s, GFX_GRAY, app.message);
+        gfxText(list_x, top_h + 140.0f * s, 1.5f * s, GFX_GRAY_DARK,
+                "Verifique a rede em Ajustes da rede, ou configure o proxy em "
+                "/dev_hdd0/tmp/ytm-proxy.txt");
+        break;
+
+    case UI_RESULTS:
+        draw_results();
+        break;
+
+    case UI_IDLE:
+    default:
+        draw_idle();
+        break;
     }
 }
 
 static void draw_player(void)
 {
-    f32 s = scale();
-    f32 h = m.player_h;
-    f32 y = (f32)gfxHeight() - h;
-    f32 bar_x = 560.0f * s;
-    f32 bar_w = (f32)gfxWidth() - bar_x - 250.0f * s;
-    f32 bar_y = y + 34.0f * s;
-    f32 progress = 0.35f;
-    f32 controls_x = (f32)gfxWidth() - 220.0f * s;
-    const track_info *now;
+    f32 h = (f32)gfxHeight();
+    f32 y = h - player_h;
+    f32 w = (f32)gfxWidth();
+    char cur[16] = "0:00", total[16] = "0:00";
+    const ytm_track *t = NULL;
+    f32 bar_x = 460.0f * s;
+    f32 bar_w = w - bar_x - 200.0f * s;
+    f32 bar_y = y + 40.0f * s;
+    f32 progress = 0.0f;
+    int pos = audio_position();
+    int dur = audio_duration();
 
-    if (filtered_count == 0)
-        now = (app.nav == 0) ? &recent_tracks[0] : &library_tracks[0];
+    if (app.playing >= 0 && app.playing < app.track_count)
+        t = &app.tracks[app.playing];
+
+    /* sem faixa carregada a barra fica zerada, mesmo que o decoder informe
+     * numeros da faixa anterior */
+    if (t == NULL)
+    {
+        pos = 0;
+        dur = 0;
+    }
+
+    gfxRect(0, y, w, player_h, GFX_ARGB(0xff, 0x0a, 0x0a, 0x0a));
+
+    draw_cover(20.0f * s, y + 16.0f * s, 56.0f * s, t != NULL);
+
+    if (t != NULL)
+    {
+        gfxText(88.0f * s, y + 22.0f * s, 2.0f * s, GFX_WHITE, t->title);
+        gfxText(88.0f * s, y + 46.0f * s, 1.5f * s, GFX_GRAY, t->artist);
+    }
     else
-        now = filtered[app.playing < filtered_count ? app.playing : 0];
+    {
+        gfxText(88.0f * s, y + 34.0f * s, 1.8f * s, GFX_GRAY_DARK,
+                "Nenhuma faixa tocando");
+    }
 
-    gfxRect(0, y, (f32)gfxWidth(), h, GFX_ARGB(0xff, 0x0a, 0x0a, 0x0a));
-    gfxRect(0, y, (f32)gfxWidth(), 2.0f * s, GFX_RED);
-
-    draw_thumbnail(24.0f * s, y + 20.0f * s, 56.0f * s, 1);
-
-    gfxText(96.0f * s, y + 26.0f * s, 2.0f * s, GFX_WHITE, now->title);
-    gfxText(96.0f * s, y + 52.0f * s, 1.5f * s, GFX_GRAY, now->artist);
+    if (dur > 0)
+    {
+        progress = (f32)pos / (f32)dur;
+        if (progress > 1.0f)
+            progress = 1.0f;
+    }
 
     gfxRect(bar_x, bar_y, bar_w, 4.0f * s, GFX_ARGB(0xff, 0x2a, 0x2a, 0x2a));
     gfxRect(bar_x, bar_y, bar_w * progress, 4.0f * s, GFX_RED);
-    gfxRect(bar_x + bar_w * progress - 3.0f * s, bar_y - 2.0f * s,
-            6.0f * s, 8.0f * s, GFX_WHITE);
+    gfxRect(bar_x + bar_w * progress - 3.0f * s, bar_y - 3.0f * s, 6.0f * s,
+            10.0f * s, GFX_WHITE);
 
-    gfxText(bar_x, bar_y + 14.0f * s, 1.5f * s, GFX_GRAY, "02:26");
-    gfxText(bar_x + bar_w - gfxTextWidth("-01:09", 1.5f * s),
-            bar_y + 14.0f * s, 1.5f * s, GFX_GRAY, "-01:09");
+    fmt_time(pos, cur, sizeof(cur));
+    fmt_time(dur, total, sizeof(total));
+    gfxText(bar_x, bar_y + 14.0f * s, 1.5f * s, GFX_GRAY, cur);
+    gfxText(bar_x + bar_w - gfxTextWidth(total, 1.5f * s), bar_y + 14.0f * s,
+            1.5f * s, GFX_GRAY, total);
 
-    draw_triangle_left(controls_x, y + 38.0f * s, 14.0f * s, 20.0f * s,
-                       GFX_GRAY);
-    gfxRect(controls_x + 24.0f * s, y + 34.0f * s, 4.0f * s, 28.0f * s,
-            GFX_GRAY);
+    /* controles */
+    {
+        f32 cx = w - 170.0f * s;
 
-    gfxRect(controls_x + 52.0f * s, y + 30.0f * s, 36.0f * s, 36.0f * s,
-            GFX_RED);
-    draw_triangle_right(controls_x + 64.0f * s, y + 38.0f * s, 14.0f * s,
-                        20.0f * s, GFX_BLACK);
-
-    draw_triangle_right(controls_x + 112.0f * s, y + 38.0f * s, 14.0f * s,
-                        20.0f * s, GFX_GRAY);
-    gfxRect(controls_x + 130.0f * s, y + 34.0f * s, 4.0f * s, 28.0f * s,
-            GFX_GRAY);
+        prev_icon(cx, y + 30.0f * s, 20.0f * s, GFX_GRAY);
+        if (audio_is_playing())
+            pause_icon(cx + 44.0f * s, y + 28.0f * s, 24.0f * s, GFX_WHITE);
+        else
+            play_icon(cx + 44.0f * s, y + 28.0f * s, 24.0f * s, GFX_WHITE);
+        next_icon(cx + 92.0f * s, y + 30.0f * s, 20.0f * s, GFX_GRAY);
+    }
 }
 
 static void draw_exit_prompt(void)
 {
-    f32 s = scale();
     f32 w = 460.0f * s;
     f32 h = 190.0f * s;
     f32 x = ((f32)gfxWidth() - w) * 0.5f;
     f32 y = ((f32)gfxHeight() - h) * 0.5f;
+    const char *labels[2] = { "Cancelar", "Sair" };
+    int i;
 
     gfxRect(0, 0, (f32)gfxWidth(), (f32)gfxHeight(), GFX_ARGB(0xc0, 0, 0, 0));
     gfxRect(x, y, w, h, GFX_ARGB(0xff, 0x16, 0x16, 0x16));
     gfxRectOutline(x, y, w, h, 2.0f * s, GFX_RED);
 
     gfxText(x + 24.0f * s, y + 24.0f * s, 3.0f * s, GFX_WHITE,
-            "Sair do CELL MUSIC?");
+            "Sair do YouTube Music?");
     gfxText(x + 24.0f * s, y + 68.0f * s, 1.5f * s, GFX_GRAY,
-            "O aplicativo sera encerrado.");
+            "A reproducao sera interrompida.");
 
-    /* opcoes */
+    for (i = 0; i < 2; i++)
     {
-        const char *labels[2] = { "Cancelar", "Sair" };
-        int i;
+        f32 bx = x + 24.0f * s + (f32)i * 200.0f * s;
+        f32 by = y + 108.0f * s;
+        int active = (app.exit_choice == i);
 
-        for (i = 0; i < 2; i++)
-        {
-            f32 bx = x + 24.0f * s + (f32)i * 200.0f * s;
-            f32 by = y + 108.0f * s;
-            int active = (app.exit_choice == i);
-
-            gfxRect(bx, by, 180.0f * s, 44.0f * s,
-                    active ? GFX_RED : GFX_ARGB(0xff, 0x24, 0x24, 0x24));
-            gfxText(bx + 16.0f * s, by + 14.0f * s, 2.0f * s,
-                    active ? GFX_BLACK : GFX_WHITE, labels[i]);
-        }
+        gfxRect(bx, by, 180.0f * s, 44.0f * s,
+                active ? GFX_RED : GFX_ARGB(0xff, 0x24, 0x24, 0x24));
+        gfxText(bx + 16.0f * s, by + 14.0f * s, 2.0f * s,
+                active ? GFX_BLACK : GFX_WHITE, labels[i]);
     }
 
     gfxText(x + 24.0f * s, y + 160.0f * s, 1.5f * s, GFX_GRAY_DARK,
             "X confirma   O cancela");
 }
 
-/* ------------------------------------------------------------------ */
-/* desenho principal                                                  */
-/* ------------------------------------------------------------------ */
-
 void ui_draw(void)
 {
-    const ui_input *in = &last_input;
-
-    compute_metrics();
+    measure();
 
     gfxFrameBegin(GFX_BLACK);
 
-    draw_top_bar(in);
-    draw_sidebar(in);
-    draw_list(in);
+    draw_top_bar();
+    draw_sidebar();
+    draw_content();
     draw_player();
 
     if (app.exit_prompt)
         draw_exit_prompt();
 
-    /* cursor do mouse sempre visivel, para mouse e teclado/controle conviverem */
     if (last_input.mouse.connected)
         draw_cursor((f32)last_input.mouse.x, (f32)last_input.mouse.y);
 }
 
 /* ------------------------------------------------------------------ */
-/* interacao                                                          */
+/* acoes                                                              */
 /* ------------------------------------------------------------------ */
+
+/* desenha um quadro imediatamente (antes de uma chamada de rede bloqueante) */
+static void flush_frame(void)
+{
+    ui_draw();
+    gfxFrameEnd();
+}
+
+static void do_search(void)
+{
+    char err[192];
+    int found = 0;
+
+    if (app.query[0] == '\0')
+        return;
+
+    app.state = UI_SEARCHING;
+    app.message[0] = '\0';
+    app.notice[0] = '\0';
+    flush_frame();
+
+    if (ytm_search(app.query, app.tracks, YTM_MAX_TRACKS, &found, err,
+                   sizeof(err)) != 0)
+    {
+        snprintf(app.message, sizeof(app.message), "%s", err);
+        app.state = UI_ERROR;
+        app.track_count = 0;
+        return;
+    }
+
+    app.track_count = found;
+    app.selected = 0;
+    app.scroll = 0;
+
+    if (found == 0)
+    {
+        snprintf(app.message, sizeof(app.message), "%s", err);
+        app.state = UI_ERROR;
+        return;
+    }
+
+    app.state = UI_RESULTS;
+    app.focus = FOCUS_LIST;
+}
+
+static void play_selected(void)
+{
+    char err[192];
+    ytm_track *t;
+
+    if (app.track_count <= 0 || app.selected >= app.track_count)
+        return;
+
+    t = &app.tracks[app.selected];
+
+    if (t->kind != YTM_KIND_SONG)
+    {
+        snprintf(app.notice, sizeof(app.notice),
+                 "%s: selecione uma musica (resultados deste tipo ainda nao "
+                 "abrem)",
+                 t->kind == YTM_KIND_ALBUM
+                     ? "Album"
+                     : (t->kind == YTM_KIND_PLAYLIST ? "Playlist" : "Artista"));
+        return;
+    }
+
+    app.notice[0] = '\0';
+    app.state = UI_LOADING;
+    snprintf(app.message, sizeof(app.message), "%s", t->title);
+    flush_frame();
+
+    if (ytm_open_track(t, err, sizeof(err)) != 0)
+    {
+        snprintf(app.message, sizeof(app.message), "%s", err);
+        app.state = UI_ERROR;
+        return;
+    }
+
+    app.playing = app.selected;
+    app.state = UI_RESULTS;
+}
 
 static void move_selection(int delta)
 {
-    if (app.focus == FOCUS_MENU)
-    {
-        app.nav = (app.nav + delta + NAV_COUNT) % NAV_COUNT;
-        rebuild_filter();
-        app.track = 0;
-        app.scroll = 0;
-    }
-    else if (filtered_count > 0)
-    {
-        app.track = (app.track + delta + filtered_count) % filtered_count;
-    }
+    if (app.state != UI_RESULTS || app.track_count == 0)
+        return;
 
-    clamp_scroll();
+    app.selected += delta;
+
+    if (app.selected < 0)
+        app.selected = app.track_count - 1;
+    if (app.selected >= app.track_count)
+        app.selected = 0;
+
+    if (app.selected < app.scroll)
+        app.scroll = app.selected;
+    if (app.selected >= app.scroll + ROWS_VISIBLE)
+        app.scroll = app.selected - ROWS_VISIBLE + 1;
 }
 
-static void activate_selection(void)
+static void handle_mouse(void)
 {
-    if (filtered_count > 0)
-    {
-        app.playing = app.track;
-        app.focus = FOCUS_LIST;
-    }
-}
-
-/* testa clique do mouse usando a mesma geometria do desenho */
-static void handle_mouse_click(const ui_input *in)
-{
-    f32 mx = (f32)in->mouse.x;
-    f32 my = (f32)in->mouse.y;
+    f32 mx = (f32)last_input.mouse.x;
+    f32 my = (f32)last_input.mouse.y;
     int i;
 
     if (app.exit_prompt)
     {
-        f32 s = scale();
         f32 w = 460.0f * s;
         f32 h = 190.0f * s;
         f32 x = ((f32)gfxWidth() - w) * 0.5f;
@@ -624,60 +719,56 @@ static void handle_mouse_click(const ui_input *in)
             my <= by + 44.0f * s)
         {
             app.exit_prompt = 0;
-            app.exit_choice = 0;
             return;
         }
 
         if (mx >= bx + 200.0f * s && mx <= bx + 380.0f * s && my >= by &&
             my <= by + 44.0f * s)
         {
-            app.exit_prompt = 2; /* marcador: confirmar saida */
+            app.exit_prompt = 2;
             return;
         }
 
         return;
     }
 
-    if (mx >= m.search_x && mx <= m.search_x + m.search_w &&
-        my >= m.search_y && my <= m.search_y + m.search_h)
+    if (mx >= search_x && mx <= search_x + search_w && my >= search_y &&
+        my <= search_y + search_h)
     {
         app.focus = FOCUS_SEARCH;
         app.search_edit = 1;
         return;
     }
 
-    for (i = 0; i < NAV_COUNT; i++)
+    for (i = 0; i < 3; i++)
     {
-        f32 y = m.nav_y + (f32)i * (m.nav_item_h + 8.0f * scale());
+        f32 y = side_y + (f32)i * (side_item_h + 4.0f * s);
 
-        if (mx >= m.nav_x && mx <= m.nav_x + m.nav_w && my >= y &&
-            my <= y + m.nav_item_h)
+        if (mx >= side_x && mx <= side_x + side_w2 && my >= y &&
+            my <= y + side_item_h)
         {
             app.nav = i;
-            app.focus = FOCUS_MENU;
-            app.track = 0;
-            app.scroll = 0;
-            rebuild_filter();
+            app.focus = FOCUS_SIDE;
             return;
         }
     }
 
-    if (mx >= m.list_x - 8.0f * scale() &&
-        mx <= m.list_x - 8.0f * scale() + m.list_w)
+    if (app.state == UI_RESULTS && mx >= list_x - 12.0f * s &&
+        mx <= list_x - 12.0f * s + list_w)
     {
-        f32 row = (my - m.list_y) / m.row_h;
+        f32 row = (my - list_y) / row_h;
         int index;
 
         if (row < 0.0f)
             return;
 
         index = app.scroll + (int)row;
-        if (index >= 0 && index < filtered_count)
+
+        if (index >= 0 && index < app.track_count)
         {
             app.focus = FOCUS_LIST;
-            app.track = index;
-            app.playing = index;
-            clamp_scroll();
+            app.selected = index;
+            play_selected();
         }
     }
 }
@@ -686,22 +777,12 @@ int ui_init(void)
 {
     memset(&app, 0, sizeof(app));
 
+    app.state = UI_IDLE;
+    app.focus = FOCUS_SEARCH;
     app.nav = 0;
-    app.focus = FOCUS_LIST;
-    app.track = 0;
-    app.playing = 0;
-    app.scroll = 0;
-    app.search[0] = '\0';
-
-    /* filtro inicial (sem pesquisa) */
-    filtered_count = 0;
-    {
-        int i;
-        const track_info *src = recent_tracks;
-
-        for (i = 0; i < MAX_TRACKS; i++)
-            filtered[filtered_count++] = &src[i];
-    }
+    app.selected = 0;
+    app.playing = -1;
+    app.audio_ok = audio_ready();
 
     return 0;
 }
@@ -713,14 +794,12 @@ void ui_update(const ui_input *in, int *exit_requested)
 
     last_input = *in;
 
-    /* 1) encerramento solicitado pelo teclado (ALT+F4) */
     if (in->kb.alt_f4)
     {
         *exit_requested = 1;
         return;
     }
 
-    /* 2) overlay de saida tem prioridade */
     if (app.exit_prompt)
     {
         if (app.exit_prompt == 2)
@@ -732,7 +811,6 @@ void ui_update(const ui_input *in, int *exit_requested)
         if (in->kb.esc || in->pad.circle)
         {
             app.exit_prompt = 0;
-            app.exit_choice = 0;
             return;
         }
 
@@ -751,10 +829,9 @@ void ui_update(const ui_input *in, int *exit_requested)
         return;
     }
 
-    /* 3) mouse */
     if (in->mouse.left)
     {
-        handle_mouse_click(in);
+        handle_mouse();
 
         if (app.exit_prompt == 2)
         {
@@ -763,13 +840,19 @@ void ui_update(const ui_input *in, int *exit_requested)
         }
     }
 
-    if (in->mouse.wheel != 0 && filtered_count > ROWS_VISIBLE)
+    if (in->mouse.wheel != 0 && app.state == UI_RESULTS &&
+        app.track_count > ROWS_VISIBLE)
     {
+        int max_scroll = app.track_count - ROWS_VISIBLE;
+
         app.scroll += (in->mouse.wheel > 0) ? 1 : -1;
-        clamp_scroll();
+
+        if (app.scroll < 0)
+            app.scroll = 0;
+        if (app.scroll > max_scroll)
+            app.scroll = max_scroll;
     }
 
-    /* 4) pedido de saida pelo controle */
     if (in->pad.select || in->pad.start)
     {
         app.exit_prompt = 1;
@@ -777,17 +860,11 @@ void ui_update(const ui_input *in, int *exit_requested)
         return;
     }
 
-    /* 5) teclado */
+    /* teclado */
     if (in->kb.esc)
     {
         if (app.search_edit)
-        {
             app.search_edit = 0;
-        }
-        else if (app.focus != FOCUS_MENU)
-        {
-            app.focus = FOCUS_MENU;
-        }
         else
         {
             app.exit_prompt = 1;
@@ -798,15 +875,8 @@ void ui_update(const ui_input *in, int *exit_requested)
 
     if (in->kb.tab)
     {
-        if (app.search_edit)
-        {
-            app.search_edit = 0;
-        }
-        else
-        {
-            app.focus = FOCUS_SEARCH;
-            app.search_edit = 1;
-        }
+        app.search_edit = app.search_edit ? 0 : 1;
+        app.focus = FOCUS_SEARCH;
     }
 
     if (app.search_edit && in->kb.text_len > 0)
@@ -815,44 +885,61 @@ void ui_update(const ui_input *in, int *exit_requested)
 
         for (i = 0; i < in->kb.text_len; i++)
         {
-            size_t len = strlen(app.search);
+            size_t len = strlen(app.query);
 
-            if (len < SEARCH_MAX)
+            if (len < QUERY_MAX)
             {
-                app.search[len] = in->kb.text[i];
-                app.search[len + 1] = '\0';
+                app.query[len] = in->kb.text[i];
+                app.query[len + 1] = '\0';
             }
         }
-
-        rebuild_filter();
-        clamp_scroll();
     }
 
     if (app.search_edit && in->kb.backspace)
     {
-        size_t len = strlen(app.search);
+        size_t len = strlen(app.query);
 
         if (len > 0)
-            app.search[len - 1] = '\0';
-
-        rebuild_filter();
-        clamp_scroll();
+            app.query[len - 1] = '\0';
     }
 
-    /* 6) navegacao */
+    if (in->kb.enter)
+    {
+        if (app.search_edit || app.state != UI_RESULTS)
+        {
+            app.search_edit = 0;
+            do_search();
+            return;
+        }
+
+        play_selected();
+        return;
+    }
+
+    /* navegacao */
     if (in->pad.up || in->kb.up)
-        move_selection(-1);
+    {
+        if (app.state == UI_RESULTS)
+            move_selection(-1);
+    }
 
     if (in->pad.down || in->kb.down)
-        move_selection(1);
+    {
+        if (app.state == UI_RESULTS)
+            move_selection(1);
+    }
 
     if (in->pad.left || in->kb.left)
-        app.focus = FOCUS_MENU;
+        app.focus = (app.focus == FOCUS_SEARCH) ? FOCUS_SEARCH : FOCUS_SIDE;
 
     if (in->pad.right || in->kb.right)
-        app.focus = (app.focus == FOCUS_MENU) ? FOCUS_LIST : app.focus;
+        app.focus = (app.focus == FOCUS_SIDE) ? FOCUS_LIST : app.focus;
 
-    /* 7) confirmar */
-    if (in->pad.cross || in->kb.enter)
-        activate_selection();
+    if (in->pad.cross)
+    {
+        if (app.state == UI_RESULTS)
+            play_selected();
+        else if (app.state != UI_SEARCHING && app.state != UI_LOADING)
+            do_search();
+    }
 }

@@ -1,14 +1,12 @@
-/* main.c - CELL MUSIC (PlayStation 3, PSL1GHT)
+/* main.c - YouTube Music para PlayStation 3 (PSL1GHT)
  *
- * Inicializacao: video/RSX -> dispositivos de entrada -> interface ->
- * eventos do sistema. O encerramento passa por um unico caminho
- * (app_shutdown), usado tanto pelo pedido do usuario (controle, teclado,
- * mouse) quanto pelo evento SYSUTIL_EXIT_GAME do XMB, para que o aplicativo
- * sempre possa ser fechado sem reiniciar o console.
+ * Inicializacao: video/RSX -> rede (SYSMODULE_NET + libcurl) -> audio
+ * (cellAudio) -> dispositivos de entrada -> interface -> eventos do sistema.
+ * O encerramento passa por um unico caminho (app_shutdown), usado tanto pelo
+ * pedido do usuario quanto pelo evento SYSUTIL_EXIT_GAME do XMB.
  */
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <sysutil/sysutil.h>
 
@@ -16,6 +14,8 @@
 #include "input_pad.h"
 #include "input_kb.h"
 #include "input_mouse.h"
+#include "audio.h"
+#include "ytm.h"
 #include "ui.h"
 
 static volatile int g_sys_exit = 0;
@@ -23,25 +23,16 @@ static int g_callback_registered = 0;
 static int g_pad_ok = 0;
 static int g_kb_ok = 0;
 static int g_mouse_ok = 0;
+static int g_audio_ok = 0;
+static int g_net_ok = 0;
 
-/* Eventos do sistema (XMB): permite sair sempre, mesmo sem perifericos. */
 static void on_sysutil_event(u64 status, u64 param, void *usrdata)
 {
     (void)param;
     (void)usrdata;
 
-    switch (status)
-    {
-    case SYSUTIL_EXIT_GAME:
+    if (status == SYSUTIL_EXIT_GAME)
         g_sys_exit = 1;
-        break;
-    case SYSUTIL_DRAW_BEGIN:
-    case SYSUTIL_DRAW_END:
-    case SYSUTIL_MENU_OPEN:
-    case SYSUTIL_MENU_CLOSE:
-    default:
-        break;
-    }
 }
 
 static void app_shutdown(void)
@@ -52,10 +43,10 @@ static void app_shutdown(void)
         g_callback_registered = 0;
     }
 
-    if (g_pad_ok)
+    if (g_mouse_ok)
     {
-        input_pad_end();
-        g_pad_ok = 0;
+        input_mouse_end();
+        g_mouse_ok = 0;
     }
 
     if (g_kb_ok)
@@ -64,10 +55,22 @@ static void app_shutdown(void)
         g_kb_ok = 0;
     }
 
-    if (g_mouse_ok)
+    if (g_pad_ok)
     {
-        input_mouse_end();
-        g_mouse_ok = 0;
+        input_pad_end();
+        g_pad_ok = 0;
+    }
+
+    if (g_audio_ok)
+    {
+        audio_shutdown();
+        g_audio_ok = 0;
+    }
+
+    if (g_net_ok)
+    {
+        ytm_shutdown();
+        g_net_ok = 0;
     }
 
     gfxShutdown();
@@ -77,45 +80,41 @@ int main(void)
 {
     ui_input in;
     int exit_requested = 0;
-    int video_ok;
 
-    printf("CELL MUSIC: iniciando\n");
+    printf("YouTube Music PS3: iniciando\n");
 
-    /* 1) video */
-    video_ok = (gfxInit() == 0);
-    if (!video_ok)
+    if (gfxInit() != 0)
     {
-        printf("CELL MUSIC: video/RSX indisponivel, encerrando\n");
+        printf("YTM: video/RSX indisponivel\n");
         gfxShutdown();
         return 1;
     }
 
-    printf("CELL MUSIC: tela %ux%u\n", gfxWidth(), gfxHeight());
+    /* rede antes da interface: a pesquisa depende dela */
+    g_net_ok = (ytm_init() == 0);
+    if (!g_net_ok)
+        printf("YTM: rede indisponivel; a pesquisa nao vai funcionar\n");
 
-    /* 2) dispositivos de entrada, antes de entrar na interface */
+    g_audio_ok = (audio_init() == 0);
+    if (!g_audio_ok)
+        printf("YTM: audio indisponivel\n");
+
     g_pad_ok = (input_pad_init() == 0);
     g_kb_ok = (input_kb_init() == 0);
     g_mouse_ok = (input_mouse_init((int)gfxWidth(), (int)gfxHeight()) == 0);
 
-    if (!g_pad_ok && !g_kb_ok && !g_mouse_ok)
-        printf("CELL MUSIC: nenhum dispositivo detectado; use o menu do XMB "
-               "para sair\n");
-
-    /* 3) interface */
     ui_init();
 
-    /* 4) eventos do sistema */
     if (sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT0, on_sysutil_event, NULL) ==
         0)
         g_callback_registered = 1;
     else
-        printf("CELL MUSIC: sysUtilRegisterCallback falhou\n");
+        printf("YTM: sysUtilRegisterCallback falhou\n");
 
     memset(&in, 0, sizeof(in));
 
     while (!exit_requested && !g_sys_exit)
     {
-        /* eventos do XMB (sair, menu aberto, etc.) */
         sysUtilCheckCallback();
 
         input_pad_poll(&in.pad);
@@ -124,11 +123,13 @@ int main(void)
 
         ui_update(&in, &exit_requested);
 
-        ui_draw(); /* ja inicia o quadro */
+        audio_service();
+
+        ui_draw();
         gfxFrameEnd();
     }
 
-    printf("CELL MUSIC: encerrando\n");
+    printf("YouTube Music PS3: encerrando\n");
 
     app_shutdown();
 

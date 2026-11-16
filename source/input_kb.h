@@ -4,7 +4,7 @@
 
 #include <ppu-types.h>
 
-#define KB_TEXT_MAX 8
+#define KB_TEXT_MAX 12
 
 typedef struct
 {
